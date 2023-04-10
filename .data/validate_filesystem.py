@@ -28,7 +28,7 @@ def main():
         directory_has_report = False
         for item in items:
             print("- Item %s" % item)
-            is_dir = os.path.isdir(item)
+            is_dir = os.path.isdir(os.path.join(path, item))
 
             if is_dir:
                 matches = [r"^(H|M|High|Medium)-\d+$", r"^\d+-(H|M|High|Medium)$", r"^false$", r"^invalid$"]

@@ -411,6 +411,62 @@ relayMessage -> does something -> send a message back
 
 Contract: https://etherscan.io/address/0xcEA770441aa5eFCD3f5501b796185Ec3055A76D7/advanced#internaltx
 
+**koolexcrypto**
+
+Escalate for 10 USDC.
+
+While the issue is creatively accurate with the specified gas values, it still requires certain conditions to be feasbile (e.g. only withdrarwals require more than 135,175 gas).
+
+According to [Sherlock's Criteria](https://docs.sherlock.xyz/audits/judging/judging#how-to-identify-a-medium-issue), it is a valid medium.
+> Causes a loss of funds but requires certain external conditions or specific states
+
+Lastly, all the respect to the good efforts put in behind this finding.
+
+
+**sherlock-admin**
+
+ > Escalate for 10 USDC.
+> 
+> While the issue is creatively accurate with the specified gas values, it still requires certain conditions to be feasbile (e.g. only withdrarwals require more than 135,175 gas).
+> 
+> According to [Sherlock's Criteria](https://docs.sherlock.xyz/audits/judging/judging#how-to-identify-a-medium-issue), it is a valid medium.
+> > Causes a loss of funds but requires certain external conditions or specific states
+> 
+> Lastly, all the respect to the good efforts put in behind this finding.
+> 
+
+You've created a valid escalation for 10 USDC!
+
+To remove the escalation from consideration: Delete your comment.
+
+You may delete or edit your escalation comment anytime before the 48-hour escalation window closes. After that, the escalation becomes final.
+
+**hrishibhat**
+
+Escalation rejected
+
+Lead Judge comment:
+```
+Maintain High Severity because while the condition is necessary it is not up to the user to decide whether that requirement was met but rather the requirement is imposed by the script 
+```
+This is a valid flaw in the system due to an incorrect assumption. 
+
+
+**sherlock-admin**
+
+> Escalation rejected
+> 
+> Lead Judge comment:
+> ```
+> Maintain High Severity because while the condition is necessary it is not up to the user to decide whether that requirement was met but rather the requirement is imposed by the script 
+> ```
+> This is a valid flaw in the system due to an incorrect assumption. 
+> 
+
+This issue's escalations have been rejected!
+
+Watsons who escalated this issue will have their escalation amount deducted from their next payout.
+
 # Issue H-2: Legacy withdrawals can be relayed twice, causing double spending of bridged assets 
 
 Source: https://github.com/sherlock-audit/2023-03-optimism-judging/issues/87 
@@ -483,7 +539,7 @@ This report is valid. The storage layout of the new `CrossDomainMessenger` contr
 Source: https://github.com/sherlock-audit/2023-03-optimism-judging/issues/40 
 
 ## Found by 
-KingNFT
+KingNFT, ShadowForce
 
 ## Summary
 The formula used in ````SafeCall.callWithMinGas()```` is not fully complying with EIP-150 and EIP-2929, the actual gas received by the sub-contract can be less than the required ````_minGas````. Withdrawal transactions can be finalized with less than specified gas limit, may lead to loss of funds.
@@ -842,101 +898,102 @@ This report is valid. The formula used in `SafeCall.callWithMinGas()` does not a
 
 The finding shows the full impact, agree with High Severity
 
-# Issue M-1: Setting `baseFeeMaxChangeDenominator` to 1 will break all deposits 
+# Issue M-1: CrossDomainMessenger does not successfully guarantee replayability, can lose user funds 
 
-Source: https://github.com/sherlock-audit/2023-03-optimism-judging/issues/89 
+Source: https://github.com/sherlock-audit/2023-03-optimism-judging/issues/96 
 
 ## Found by 
 obront
 
 ## Summary
 
-If `baseFeeMaxChangeDenominator` is set to `1`, then the first time that a block is skipped with no deposits, the deposit function will stop working. All depositing into the L2 will remain impossible until `baseFeeMaxChangeDenominator` is set to a value other than 1.
+While `SafeCall.callWithMinGas` successfully ensures that the called function will not revert, it does not ensure any remaining buffer for continued execution on the calling contract.
+
+As a result, there are situations where `OptimismPortal` can be called with an amount of gas such that the remaining gas after calling `L1CrossDomainMessenger` is sufficient to finalize the transaction, but such that the remaining gas after `L1CrossDomainMessenger` makes its call to target is insufficient to mark the transaction as successful or failed.
+
+In any of these valid scenarios, users who withdraw using the L1CrossDomainMessenger (expecting replayability) will have their withdrawals bricked, permanently losing their funds.
 
 ## Vulnerability Detail
 
-The upgraded `ResourceMetering.sol` contract allows the admins to set the important parameters used to calculate gas costs for deposits.
+When a user performs a withdrawal with the `L1CrossDomainMessenger`, they include a `gasLimit` value, which specifies the amount of gas that is needed for the function to execute on L1.
 
-One of those parameters is the `baseFeeMaxChangeDenominator`. This variable is used to determine the rate at which the last block's gas market moves the gas price, where 1 means the gas price is determined completely by the previous block, and higher numbers mean that the previous state is more highly weighted over the most recent block.
+This value is translated into two separate values:
 
-The formula can be simplified to: `baseFeeDelta = prevBaseFee * (1 + (% gas used above or below target / baseFeeMaxChangeDenominator))`
+1) The `OptimismPortal` sends at least `baseGas(_message, _minGasLimit) = 64/63 * _minGasLimit + 16 * data.length + 200_000` to `L1CrossDomainMessenger`, which accounts for the additional overhead used by the Cross Domain Messenger.
 
-When setting this parameter, there is a check to ensure that the value is set to a positive number:
+2) The `L1CrossDomainMessenger` sends at least `_minGasLimit` to the target contract.
+
+The core of this vulnerability is in the fact that, if:
+- `OptimismPortal` retains sufficient gas after its call to complete the transaction, and
+- `L1CrossDomainMessenger` runs out of gas after its transaction is complete (even if the tx succeeded)
+
+...then the result will be that the transaction is marked as finalized in the Portal (disallowing it from being called again), while the Cross Domain Messenger transaction will revert, causing the target transaction to revert and not setting it in `failedMessages` (disallowing it from being replayed). The result is that the transaction will be permanently stuck.
+
+## Calcuations
+
+Let's run through the math to see how this might unfold. We will put aside the additional gas allocated for calldata length, because this amount is used up in the call and doesn't materially impact the calculations.
+
+When the `OptimismPortal` calls the `L1CrossDomainMessenger`, it is enforced that the gas sent will be greater than or equal to `_minGasLimit * 64/63 + 200_000`.
+
+This ensures that the remaining gas for the `OptimismPortal` to continue execution after the call is at least `_minGasLimit / 64 + 3125`. Even assuming that `_minGasLimit == 0`, this is sufficient for `OptimismPortal` to complete execution, so we can safely say that any time `OptimismPortal.finalizeWithdrawalTransaction()` is called with sufficient gas to pass the `SafeCall.callWithMinGas()` check, it will complete execution.
+
+Moving over to `L1CrossDomainMessenger`, our call begins with at least `_minGasLimit * 64/63 + 200_000` gas. By the time we get to the external call, we have remaining gas of at least `_minGasLimit * 64/63 + 158_998`. This leaves us with the following guarantees:
+
+1) Gas available for the external call will be at least 63/64ths of that, which equals `_minGasLimit + 156_513`.
+2) Gas available for continued execution after the call will be at least 1/64th of that, which equals `_minGasLimit * 1/63 + 3125`.
+
+The additional gas required to mark the transaction as `failedMessages[versionedHash] = true` and complete the rest of the execution is `23,823`.
+
+Therefore, in any situation where the external call uses all the available gas will revert if `_minGasLimit * 1/63 + 3125 < 23_823`, which simplifies to `_minGasLimit < 1_303_974`. In other words, in most cases.
+
+However, it should be unusual for the external call to use all the available gas. In most cases, it should only use `_minGasLimit`, which would leave `156_513` available to resolve this issue.
+
+So, let's look at some examples of times when this may not be the case.
+
+## At Risk Scenarios
+
+There are several valid scenarios where users might encounter this issue, and have their replayable transactions stuck:
+
+### User Sends Too Little Gas
+
+The expectation when using the Cross Domain Messenger is that all transactions will be replayable. Even if the `_minGasLimit` is set incorrectly, there will always be the opportunity to correct this by replaying it yourself with a higher gas limit. In fact, it is a core tenet of the Cross Domain Messengers that they include replay protection for failed transactions.
+
+However, if a user sets a gas limit that is too low for a transaction, this issue may result.
+
+The consequence is that, while users think that Cross Domain Messenger transactions are replayable and gas limits don't need to be set precisely, they can in fact lose their entire withdrawal if they set their gas limit too low, even when using the "safe" Standard Bridge or Cross Domain Messenger.
+
+### Target Contract Uses More Than Minimum Gas
+
+The checks involved in this process ensure that sufficient gas is being sent to a contract, but there is no requirement that that is all the gas a contract uses.
+
+`_minGasLimit` should be set sufficiently high for the contract to not revert, but that doesn't mean that `_minGasLimit` represents the total amount of gas the contract uses.
+
+As a silly example, let's look at a modified version of the `gas()` function in your `Burn.sol` contract:
 ```solidity
-require(_config.baseFeeMaxChangeDenominator > 0, "SystemConfig: denominator cannot be 0");
-```
-However, this check is not sufficient. In the case where the parameter is set to `1`, it will revert in any situation where multiple blocks are processed at once, due to the implementation of the `cdexp()` function.
-
-First, here is how the base fee is calculated when multiple blocks are skipped:
-```solidity
-if (blockDiff > 1) {
-    // Update the base fee by repeatedly applying the exponent 1-(1/change_denominator)
-    // blockDiff - 1 times. Simulates multiple empty blocks. Clamp the resulting value
-    // between min and max.
-    newBaseFee = Arithmetic.clamp({
-        _value: Arithmetic.cdexp({
-            _coefficient: newBaseFee,
-            _denominator: int256(uint256(config.baseFeeMaxChangeDenominator)),
-            _exponent: int256(blockDiff - 1)
-        }),
-        _min: int256(uint256(config.minimumBaseFee)),
-        _max: int256(uint256(config.maximumBaseFee))
-    });
-}
-```
-We call the `cdexp()` function with `newBaseFee`, `baseFeeMaxChangeDenominator`, and `blockDiff-1` as arguments.
-
-That function is implemented as:
-```solidity
-function cdexp(
-    int256 _coefficient,
-    int256 _denominator,
-    int256 _exponent
-) internal pure returns (int256) {
-    return
-        (_coefficient *
-            (FixedPointMathLib.powWad(1e18 - (1e18 / _denominator), _exponent * 1e18))) / 1e18;
-}
-```
-If we plug in our arguments, this becomes:
-
-`newBaseFee * (powWad(1e18 - (1e18 / baseFeeMaxChangeDenominator), (blockDiff-1 * 1e18))) / 1e18`
-
-Simplifying further and substiting `1` in for `baseFeeMaxChangeDenominator`, we get:
-
-`newBaseFee * powWad(0, blockDiff-1 * 1e18) / 1e18`
-
-If we look at the implementation for `powWad()`, we see:
-```solidity
-function powWad(int256 x, int256 y) internal pure returns (int256) {
-    // Equivalent to x to the power of y because x ** y = (e ** ln(x)) ** y = e ** (ln(x) * y)
-    return expWad((lnWad(x) * y) / int256(WAD)); // Using ln(x) means x must be greater than 0.
-}
-```
-This calls `lnWad(x)`, which would be `lnWad(0)`. Here is the start of that function:
-```soliidty
-function lnWad(int256 x) internal pure returns (int256 r) {
-    unchecked {
-        require(x > 0, "UNDEFINED");
-        ...
+function gas(uint256 _amountToLeave) internal view {
+    uint256 i = 0;
+    while (gasleft() > _amountToLeave) {
+        ++i;
     }
 }
 ```
-This will revert with an error message of `UNDEFINED`, and the deposit will not be able to be processed.
+This function runs until it leaves a specified amount of gas, and then returns. While the amount of gas sent to this contract could comfortably exceed the `_minGasLimit`, it would not be safe to assume that the amount leftover afterwards would equal `startingGas - _minGasLimit`.
+
+While this is a contrived example, but the point is that there are many situations where it is not safe to assume that the minimum amount of gas a function needs will be greater than the amount it ends up using, if it is provided with extra gas.
+
+In these cases, the assumption that our leftover gas after the function runs will be greater than the required 1/64th does not hold, and the withdrawal can be bricked.
 
 ## Impact
 
-If `baseFeeMaxChangeDenominator` is set to `1`, then the first time that a block is skipped with no deposits, the deposit function will become bricked. As the `blockDiff` will never go down after this point, all deposits will remain bricked until `baseFeeMaxChangeDenominator` is set to a value other than 1.
+In certain valid scenarios where users decide to use the "safe" Cross Domain Messenger or Standard Bridge with the expectation of replayability, their withdrawals from L2 to L1 can be bricked and permanently lost.
+
 
 ## Code Snippet
 
-https://github.com/ethereum-optimism/optimism/blob/9b9f78c6613c6ee53b93ca43c71bb74479f4b975/packages/contracts-bedrock/contracts/L1/SystemConfig.sol#L280
+https://github.com/ethereum-optimism/optimism/blob/9b9f78c6613c6ee53b93ca43c71bb74479f4b975/packages/contracts-bedrock/contracts/L1/OptimismPortal.sol#L315-L412
 
-https://github.com/ethereum-optimism/optimism/blob/9b9f78c6613c6ee53b93ca43c71bb74479f4b975/packages/contracts-bedrock/contracts/L1/ResourceMetering.sol#L119-L138
+https://github.com/ethereum-optimism/optimism/blob/9b9f78c6613c6ee53b93ca43c71bb74479f4b975/packages/contracts-bedrock/contracts/universal/CrossDomainMessenger.sol#L291-L383
 
-https://github.com/transmissions11/solmate/blob/ed67feda67b24fdeff8ad1032360f0ee6047ba0a/src/utils/FixedPointMathLib.sol#L29-L32
-
-https://github.com/transmissions11/solmate/blob/ed67feda67b24fdeff8ad1032360f0ee6047ba0a/src/utils/FixedPointMathLib.sol#L94
 
 ## Tool used
 
@@ -944,11 +1001,8 @@ Manual Review
 
 ## Recommendation
 
-When setting the `baseFeeMaxChangeDenominator` parameter, ensure the value is greater than 1:
-```diff
--require(_config.baseFeeMaxChangeDenominator > 0, "SystemConfig: denominator cannot be 0");
-+require(_config.baseFeeMaxChangeDenominator > 1, "SystemConfig: denominator must be greater than 1");
-```
+`L1CrossDomainMessenger` should only send `_minGasLimit` along with its call to the target (rather than `gas()`) to ensure it has sufficient leftover gas to ensure replayability.
+
 
 
 
@@ -957,11 +1011,60 @@ When setting the `baseFeeMaxChangeDenominator` parameter, ensure the value is gr
 **hrishibhat**
 
 Sponsor comment:
-This is a valid finding for the resource metering configuration parameter checks.
+ Tentatively marking this as medium for several reasons. First, this issue can only be encountered through user misconfiguration. If a sufficient minimum gas limit is supplied to the withdrawal transaction, it won't occur. However, it is a valid issue and it does break the CrossDomainMessenger's replayability guarantee.
 
 **GalloDaSballo**
 
-Agree with Med due to reliance on condition
+Agree with Medium, because reliant on the specific tx type as well as the user mistake
+
+Agree with maintaining Medium because the code's goal is to ensure replayability even if the tx run OOG, expectation which the POC shows can be broken
+
+**GalloDaSballo**
+
+Made #5 primary
+
+
+**zobront**
+
+Escalate for 10 USDC
+
+This was dup'd with #5, but they appear to be different issues.
+
+#5 focuses on the risks of long message data increasing gas costs. This is more of an obscure edge case (and has a live escalation about the validity of their hash function assumptions, which I don't have an opinion on.)
+
+However, this is a separate issue, which focuses on the risks around gas usage in the target contract and how it can break the replayability guarantee.
+
+**sherlock-admin**
+
+ > Escalate for 10 USDC
+> 
+> This was dup'd with #5, but they appear to be different issues.
+> 
+> #5 focuses on the risks of long message data increasing gas costs. This is more of an obscure edge case (and has a live escalation about the validity of their hash function assumptions, which I don't have an opinion on.)
+> 
+> However, this is a separate issue, which focuses on the risks around gas usage in the target contract and how it can break the replayability guarantee.
+
+You've created a valid escalation for 10 USDC!
+
+To remove the escalation from consideration: Delete your comment.
+
+You may delete or edit your escalation comment anytime before the 48-hour escalation window closes. After that, the escalation becomes final.
+
+**hrishibhat**
+
+Escalation accepted
+
+Considering this issue a separate valid medium
+
+**sherlock-admin**
+
+> Escalation accepted
+> 
+> Considering this issue a separate valid medium
+
+This issue's escalations have been accepted!
+
+Contestants' payouts and scores will be updated according to the changes made on this issue.
 
 # Issue M-2: Gas usage of cross-chain messages is undercounted, causing discrepancy between L1 and L2 and impacting intrinsic gas calculation 
 
@@ -1082,127 +1185,7 @@ All l1 -> l2 tx are underpriced by that amount (roughly 10% of fixed base cost)
 
 Can see this being escalated against because it's "only" 10% incorrect, but find hard to argue against the math not being correct
 
-# Issue M-3: Estimating gas required to relay the message on both L1 and L2 is incorrect 
-
-Source: https://github.com/sherlock-audit/2023-03-optimism-judging/issues/77 
-
-## Found by 
-Koolex
-
-## Summary
-Estimating gas required to relay the message on both L1 and L2 is incorrect
-
-
-## Vulnerability Detail
-The gas estimation for `L1CrossDomainMessenger.relayMessage` and `L2CrossDomainMessenger.relayMessage` doesn't take into account the line that clears the reentrancy lock for `versionedHash`
-```solidity
- reentrancyLocks[versionedHash] = false;
-```
-
-This is the old code
-```solidity
-	if (success == true) {
-		successfulMessages[versionedHash] = true;
-		emit RelayedMessage(versionedHash);
-	} else {
-		failedMessages[versionedHash] = true;
-		emit FailedRelayedMessage(versionedHash);
-
-		// Revert in this case if the transaction was triggered by the estimation address. This
-		// should only be possible during gas estimation or we have bigger problems. Reverting
-		// here will make the behavior of gas estimation change such that the gas limit
-		// computed will be the amount required to relay the message, even if that amount is
-		// greater than the minimum gas limit specified by the user.
-		if (tx.origin == Constants.ESTIMATION_ADDRESS) {
-			revert("CrossDomainMessenger: failed to relay message");
-		}
-	}
-```
-
-And the new one is
-```solidity
-	if (success) {
-		successfulMessages[versionedHash] = true;
-		emit RelayedMessage(versionedHash);
-	} else {
-		failedMessages[versionedHash] = true;
-		emit FailedRelayedMessage(versionedHash);
-
-		// Revert in this case if the transaction was triggered by the estimation address. This
-		// should only be possible during gas estimation or we have bigger problems. Reverting
-		// here will make the behavior of gas estimation change such that the gas limit
-		// computed will be the amount required to relay the message, even if that amount is
-		// greater than the minimum gas limit specified by the user.
-		if (tx.origin == Constants.ESTIMATION_ADDRESS) {
-			revert("CrossDomainMessenger: failed to relay message");
-		}
-	}
-
-	// Clear the reentrancy lock for `versionedHash`
-	reentrancyLocks[versionedHash] = false;
-```
-
-
-As you can see in the old code, the revert is at the end to account for all Opcodes before. However, in the new code, it doesn't consider the last line `reentrancyLocks[versionedHash] = false` .
-
-## Impact
-Wrong estimation of the gas limit amount required to relay the message on both L1 and L2
-
-## Code Snippet
-
-https://github.com/sherlock-audit/2023-03-optimism/blob/main/optimism/packages/contracts-bedrock/contracts/universal/CrossDomainMessenger.sol#L382
-
-
-## Tool used
-
-Manual Review
-
-## Recommendation
-
- 
-Move the revert to the end, and add a check for the `success`. So it becomes as follows:
-
-```solidity
-		// Clear the reentrancy lock for `versionedHash`
-		reentrancyLocks[versionedHash] = false;
-
-		if (success == false && tx.origin == Constants.ESTIMATION_ADDRESS) {
-			revert("CrossDomainMessenger: failed to relay message");
-		}
-```
-
-  
-
-
-
-## Discussion
-
-**GalloDaSballo**
-
-Valid, incorrect behaviour in estimating in my opinion
-
-Due to discrepancy, I do recommend Medium Severity as the result of the estimate will most often result in Reverts when the output from the estimate is expected to be sufficient gas to prevent this scenario
-
-**hrishibhat**
-
-Sponsor comment:
-Gas estimation is low actionable.
-
-**GalloDaSballo**
-
-I recommend Medium Severity
-
-The finding shows a reliable way to get incorrect estimates which can lead to behaviour that will cause loss of funds, I don't see this as a risk that the protocol is willing to take because anyone using the math will get the wrong result
-
-
-
-**GalloDaSballo**
-
-I would maintain Medium Severity, in contrast to Sherlocks rule around integration, the gas estimate is meant to be used by end users, it being wrong leaves the option for bigger griefs  (OOG Reverts, not explained here)
-
-Fine with getting this escalated against if majority of people disagrees
-
-# Issue M-4: Malicious actor can prevent migration by calling a non-existing function in `OVM_L2ToL1MessagePasser` and making `ReadWitnessData` return an error 
+# Issue M-3: Malicious actor can prevent migration by calling a non-existing function in `OVM_L2ToL1MessagePasser` and making `ReadWitnessData` return an error 
 
 Source: https://github.com/sherlock-audit/2023-03-optimism-judging/issues/67 
 
@@ -1286,540 +1269,71 @@ Sponsor comment:
 
 Temporary DOS, not acceptable risk, agree with Med
 
-# Issue M-5: Malicious user can finalize other’s withdrawal with precise amount of gas, leading to loss of funds even after the fix 
+# Issue M-4: Usage of **revert** in case of low gas in `L1CrossDomainMessenger` can result in loss of fund 
 
-Source: https://github.com/sherlock-audit/2023-03-optimism-judging/issues/37 
+Source: https://github.com/sherlock-audit/2023-03-optimism-judging/issues/27 
 
 ## Found by 
-ShadowForce
+HE1M
 
 ## Summary
-Malicious user can finalize other’s withdrawal with precise amount of gas, leading to loss of funds even after the fix
+
+I am reporting this issue separate from my other report `Causing users lose fund if bridging long message from L2 to L1 due to uncontrolled out-of-gas error`, as I think they provide different attack surface and vulnerability.
+
+In the previous report, it is explained that if the forwarded gas passes the gas condition in `OptimismPortal`, but goes out of gas  in `L1CrossDomainMessenger`, it will result in loss of fund since `baseGas` does not consider the effect of memory expansion.
+
+But, in this report, I am going to explain that due to usage of `revert` opcode instead of `return`, users can lose fund if for any reason the gas left is not meeting the condition in `L1CrossDomainMessenger`.
+
+In other words, there is a check for the amount of gas provided in `callWithMinGas`. This check is invoked twice: One in `OptimismPortal.finalizeWithdrawalTransaction` and one in  `L1CrossDomainMessenger.relayMessage`. If the first check is passed, and the second check is not passed, the users' withdrawal transactions are considered as finalized, but not considered as failed message. So, they can not replay their withdrawal transactions.
+
 ## Vulnerability Detail
-In the previous contest, we observed an exploit very similar to this one found by zachobront and trust. In this current, contest the team has employed some fixes to try to mitigate the risk outlined by the previous issue.
 
-The way the protocol tried to achieve this was by removing the gas buffer and instead implement this assertion below:
-Assertion: gasleft() >= ((_minGas + 200) * 64) / 63
+Suppose Alice (an honest user) intends to bridge a message from L2 to L1 by calling `sendMessage`:
+https://github.com/sherlock-audit/2023-03-optimism/blob/main/optimism/packages/contracts-bedrock/contracts/universal/CrossDomainMessenger.sol#L247
 
-The protocol did this in the `callWithMinGas()` function by implementing the assertion's logic using assembly. we can observe that below.
-```solidity
-    function callWithMinGas(
-        address _target,
-        uint256 _minGas,
-        uint256 _value,
-        bytes memory _calldata
-    ) internal returns (bool) {
-        bool _success;
-        assembly {
-            // Assertion: gasleft() >= ((_minGas + 200) * 64) / 63
-            //
-            // Because EIP-150 ensures that, a maximum of 63/64ths of the remaining gas in the call
-            // frame may be passed to a subcontext, we need to ensure that the gas will not be
-            // truncated to hold this function's invariant: "If a call is performed by
-            // `callWithMinGas`, it must receive at least the specified minimum gas limit." In
-            // addition, exactly 51 gas is consumed between the below `GAS` opcode and the `CALL`
-            // opcode, so it is factored in with some extra room for error.
-            if lt(gas(), div(mul(64, add(_minGas, 200)), 63)) {
-                // Store the "Error(string)" selector in scratch space.
-                mstore(0, 0x08c379a0)
-                // Store the pointer to the string length in scratch space.
-                mstore(32, 32)
-                // Store the string.
-                //
-                // SAFETY:
-                // - We pad the beginning of the string with two zero bytes as well as the
-                // length (24) to ensure that we override the free memory pointer at offset
-                // 0x40. This is necessary because the free memory pointer is likely to
-                // be greater than 1 byte when this function is called, but it is incredibly
-                // unlikely that it will be greater than 3 bytes. As for the data within
-                // 0x60, it is ensured that it is 0 due to 0x60 being the zero offset.
-                // - It's fine to clobber the free memory pointer, we're reverting.
-                mstore(88, 0x0000185361666543616c6c3a204e6f7420656e6f75676820676173)
+The amount of required gas is calculated in the function `baseGas`:
+https://github.com/sherlock-audit/2023-03-optimism/blob/main/optimism/packages/contracts-bedrock/contracts/universal/CrossDomainMessenger.sol#L258
+https://github.com/sherlock-audit/2023-03-optimism/blob/main/optimism/packages/contracts-bedrock/contracts/universal/CrossDomainMessenger.sol#L423
 
-                // Revert with 'Error("SafeCall: Not enough gas")'
-                revert(28, 100)
-            }
+Suppose some time is passed, and an EIP is proposed so that the gas consumption of some opcodes are changed. During this time, still Alice's withdrawal transaction is not executed on L1 yet.
 
-            // The call will be supplied at least (((_minGas + 200) * 64) / 63) - 49 gas due to the
-            // above assertion. This ensures that, in all circumstances, the call will
-            // receive at least the minimum amount of gas specified.
-            // We can prove this property by solving the inequalities:
-            // ((((_minGas + 200) * 64) / 63) - 49) >= _minGas
-            // ((((_minGas + 200) * 64) / 63) - 51) * (63 / 64) >= _minGas
-            // Both inequalities hold true for all possible values of `_minGas`.
-            _success := call(
-                gas(), // gas
-                _target, // recipient
-                _value, // ether value
-                add(_calldata, 32), // inloc
-                mload(_calldata), // inlen
-                0x00, // outloc
-                0x00 // outlen
-            )
-        }
-        return _success;
-    }
-}
-```
-This addition was not sufficient to mitigate the risk. A malicious user can still use a specific amount of gas on `finalizeWithdrawalTransaction` to cause a Loss Of Funds for another user.
+Bob (the attacker), after proving the Alice's withdrawal transaction and passing the challenge period, calls `finalizeWithdrawalTransaction` to finalize Alice's withdrawal transaction.
+https://github.com/sherlock-audit/2023-03-optimism/blob/main/optimism/packages/contracts-bedrock/contracts/L1/OptimismPortal.sol#L315
 
-According the PR comments, the protocol intended to reserve at least 20000 wei gas buffer, but the implementation only reserve 200 wei of gas.
-```solidity
-if lt(gas(), div(mul(64, add(_minGas, 200)), 63)) {
-```
+Bob provides the the required gas calculated by `baseGas` function on L2. This amount of gas passes the check in `OptimimPortal`. So, the mapping `finalizedWithdrawals` is set to true.
+https://github.com/sherlock-audit/2023-03-optimism/blob/main/optimism/packages/contracts-bedrock/contracts/L1/OptimismPortal.sol#L397
+https://github.com/sherlock-audit/2023-03-optimism/blob/main/optimism/packages/contracts-bedrock/contracts/libraries/SafeCall.sol#L64
+https://github.com/sherlock-audit/2023-03-optimism/blob/main/optimism/packages/contracts-bedrock/contracts/L1/OptimismPortal.sol#L383
 
-![optimismFixProof](https://user-images.githubusercontent.com/83630967/230210180-b6c531b4-e1a0-453d-b7bf-d1482fb74ea2.png)
-https://github.com/ethereum-optimism/optimism/pull/4954
+And the left gas will be forwarded to `L1CrossDomainMessenger` calling `relayMessage`.
+https://github.com/sherlock-audit/2023-03-optimism/blob/main/optimism/packages/contracts-bedrock/contracts/universal/CrossDomainMessenger.sol#L291
 
+Suppose for any reason (like what assumed above: an EIP was proposed and it changed some opcodes gas), the gas consumption in `relayMessage` is more than expected, so that it does not pass gas condition:
+https://github.com/sherlock-audit/2023-03-optimism/blob/main/optimism/packages/contracts-bedrock/contracts/universal/CrossDomainMessenger.sol#L361
+https://github.com/sherlock-audit/2023-03-optimism/blob/main/optimism/packages/contracts-bedrock/contracts/libraries/SafeCall.sol#L64
+
+Since, it does not pass the gas condition, it will revert in [Line 82](https://github.com/sherlock-audit/2023-03-optimism/blob/main/optimism/packages/contracts-bedrock/contracts/libraries/SafeCall.sol#L82).
+
+But, the revert here (in `L1CrossDomainMessenger.relayMessage`) is not correct. Because, the whole transaction of `relayMessage` will be reverted so it will **not** set the flag `failedMessages[versionedHash]` as `true`.
+https://github.com/sherlock-audit/2023-03-optimism/blob/main/optimism/packages/contracts-bedrock/contracts/universal/CrossDomainMessenger.sol#L368
+
+Since, the withdrawal transaction is set as finalized in `OptimismPortal` but not set as failed in `L1CrossDomainMessenger`, it can not be replayed, and Alice loses her fund.
 
 
 ## Impact
-Malicious user can finalize another user's withdrawal with a precise amount of gas to ultimately grief the user's withdrawal and lose his funds completely.
+Causing users lose fund.
+
 ## Code Snippet
-https://github.com/ethereum-optimism/optimism/blob/4ea4202510b6247c36aedda4acc2057826df784e/packages/contracts-bedrock/contracts/L1/OptimismPortal.sol#L388-L413
 
-https://github.com/ethereum-optimism/optimism/blob/4ea4202510b6247c36aedda4acc2057826df784e/packages/contracts-bedrock/contracts/universal/CrossDomainMessenger.sol#L291-L384
-## Proof Of Concept
-below is a foundry test that demonstrates how a malicious user can still specify a gas that can pass checks but also reverts which will cause a user's funds to be stuck
+## Tool used
+
+Manual Review
+
+## Recommendation
+
+I would say that the `callWithMinGas` should return `false` instead of `revert` when called during `L1CrossDomainMessenger.relayMessage` if the condition of required gas is not met. The following modification in `L1CrossDomainMessenger.relayMessage` is recommended.
 ```solidity
-// SPDX-License-Identifier: UNLICENSED
-pragma solidity ^0.8.13;
-
-import "forge-std/Test.sol";
-import "../src/Exploit.sol";
-import "../src/RelayMessagerReentrancy.sol";
-import "../src/Portal.sol";
-import "forge-std/console.sol";
-
-contract CounterTest is Test {
-
-    RelayMessagerReentrancy messager = new RelayMessagerReentrancy(address(this));
-    Exploit exploit = new Exploit(address(messager));
-    Portal portal = new Portal(address(messager));
-
-    uint256 nonce = 1;
-    address sender = address(this);
-    address target = address(exploit);
-    uint256 value = 0;
-    uint256 minGasLimit = 100000000 wei;
-
-    function createMessage() public returns (bytes memory) {
-
-        bytes memory message = abi.encodeWithSelector(
-            Exploit.call.selector,
-            messager,
-            3,
-            sender,
-            target,
-            0,
-            minGasLimit
-        );
-
-        return message;
-
-    }
-
-    function setUp() public {
-
-    }
-
-    function testHasEnoughGas() public {
-
-        address bob = address(1231231243);
-
-        console.log("bob's balance before");
-        console.log(bob.balance);
-
-        uint256 minGasLimit = 30000 wei;
-
-        address sender = address(this);
-
-        address target = bob;
-
-        bytes memory message = abi.encodeWithSelector(
-            '0x',
-            messager,
-            4,
-            sender,
-            target,
-            1 ether,
-            minGasLimit
-        );
-
-        bytes memory messageRelayer = abi.encodeWithSelector(
-            RelayMessagerReentrancy.relayMessage.selector,
-            4,
-            sender,
-            target,
-            1 ether,
-            minGasLimit,
-            message   
-        );
-
-        portal.finalizeWithdraw{value: 1 ether, gas: 200000 wei}(minGasLimit, 1 ether, messageRelayer);
-
-        console.log("bob's balance after the function call");
-        console.log(bob.balance);
-
-    }
-
-
-
-    function testOutOfGas() public {
-
-        address bob = address(1231231243);
-
-        console.log("bob's balance before");
-        console.log(bob.balance);
-
-        uint256 minGasLimit = 30000 wei;
-
-        address sender = address(this);
-
-        address target = bob;
-
-        bytes memory message = abi.encodeWithSelector(
-            '0x',
-            messager,
-            4,
-            sender,
-            target,
-            1 ether,
-            minGasLimit
-        );
-
-        bytes memory messageRelayer = abi.encodeWithSelector(
-            RelayMessagerReentrancy.relayMessage.selector,
-            4,
-            sender,
-            target,
-            1 ether,
-            minGasLimit,
-            message   
-        );
-
-        portal.finalizeWithdraw{value: 1 ether, gas: 110000 wei}(minGasLimit, 1 ether, messageRelayer);
-
-        console.log("bob's balance after the function call");
-        console.log(bob.balance);
-
-    }
-
-}
-```
-when running the test the outcome is as follows
-```solidity
-Running 2 tests for test/RelayMessagerReentrancy.t..sol:CounterTest
-[PASS] testHasEnoughGas() (gas: 130651)
-Logs:
-  bob's balance before
-  0
-  gas left after externall call
-  100196
-  gas needed after external call
-  25038
-  success after finalize withdraw????
-  true
-  bob's balance after the function call
-  1000000000000000000
-
-[PASS] testOutOfGas() (gas: 136001)
-Logs:
-  bob's balance before
-  0
-  gas left after externall call
-  11603
-  success after finalize withdraw????
-  false
-  bob's balance after the function call
-  0
-
-Test result: ok. 2 passed; 0 failed; finished in 1.58ms
-```
-As you can see in the first test, when supplying enough gas for the external call, the test passes and bobs balance is changed to reflect the withdraw.
-
-On the contrary, the second test which does not have sufficient gas for the external call. The test passes but bob's balance is never updated. This clearly shows that bob's funds are lost.
-
-some things to note from the test:
-
-1. Approximately 25,000 wei of gas is needed after the external call.
-2. the 2nd test only had 11,603 gas remaining so the function reverts silently
-3. Malicious user can take advantage of this and ensure the gas remaining after the external call 
-```solidity
- bool success = SafeCall.callWithMinGas(_target, _minGasLimit, _value, _message);
-```
-
-  In RelayMessenge, is less than 25,000 wei in order to grief another user's withdrawal causing his funds to be permanently lost
-
-the 25000 wei gas is the approximate amount of gas needed to complete the code execution clean up in `RelayMessenge` function call. (we use the word approximate because console.log also consumes some gas)
-```solidity
-uint256 glBefore = gasleft();
-
-console.log("gas left after externall call");
-console.log(glBefore);
-
-xDomainMsgSender = DEFAULT_L2_SENDER;
-
-if (success) {
-    successfulMessages[versionedHash] = true;
-    emit RelayedMessage(versionedHash);
-} else {
-    failedMessages[versionedHash] = true;
-    emit FailedRelayedMessage(versionedHash);
-
-     if (tx.origin == ESTIMATION_ADDRESS) {
-        revert("CrossDomainMessenger: failed to relay message");
-    }
-}
-
-// Clear the reentrancy lock for `versionedHash`
-reentrancyLocks[versionedHash] = false;
-
-uint256 glAfter = gasleft();
-
-console.log("gas needed after external call");
-console.log(glBefore - glAfter);
-```
-
-below are the imports used to help us run this test.
-RelayMessagerReentrancy.sol
-```solidity
-// SPDX-License-Identifier: MIT
-pragma solidity ^0.8.13;
-
-import "forge-std/console.sol";
-
-/**
- * @title SafeCall
- * @notice Perform low level safe calls
- */
-library SafeCall {
-    /**
-     * @notice Perform a low level call without copying any returndata
-     *
-     * @param _target   Address to call
-     * @param _gas      Amount of gas to pass to the call
-     * @param _value    Amount of value to pass to the call
-     * @param _calldata Calldata to pass to the call
-     */
-    function call(
-        address _target,
-        uint256 _gas,
-        uint256 _value,
-        bytes memory _calldata
-    ) internal returns (bool) {
-        bool _success;
-        assembly {
-            _success := call(
-                _gas, // gas
-                _target, // recipient
-                _value, // ether value
-                add(_calldata, 32), // inloc
-                mload(_calldata), // inlen
-                0, // outloc
-                0 // outlen
-            )
-        }
-        return _success;
-    }
-
-    /**
-     * @notice Perform a low level call without copying any returndata. This function
-     *         will revert if the call cannot be performed with the specified minimum
-     *         gas.
-     *
-     * @param _target   Address to call
-     * @param _minGas   The minimum amount of gas that may be passed to the call
-     * @param _value    Amount of value to pass to the call
-     * @param _calldata Calldata to pass to the call
-     */
-    function callWithMinGas(
-        address _target,
-        uint256 _minGas,
-        uint256 _value,
-        bytes memory _calldata
-    ) internal returns (bool) {
-        bool _success;
-        assembly {
-            // Assertion: gasleft() >= ((_minGas + 200) * 64) / 63
-            //
-            // Because EIP-150 ensures that, a maximum of 63/64ths of the remaining gas in the call
-            // frame may be passed to a subcontext, we need to ensure that the gas will not be
-            // truncated to hold this function's invariant: "If a call is performed by
-            // `callWithMinGas`, it must receive at least the specified minimum gas limit." In
-            // addition, exactly 51 gas is consumed between the below `GAS` opcode and the `CALL`
-            // opcode, so it is factored in with some extra room for error.
-            if lt(gas(), div(mul(64, add(_minGas, 200)), 63)) {
-                // Store the "Error(string)" selector in scratch space.
-                mstore(0, 0x08c379a0)
-                // Store the pointer to the string length in scratch space.
-                mstore(32, 32)
-                // Store the string.
-                //
-                // SAFETY:
-                // - We pad the beginning of the string with two zero bytes as well as the
-                // length (24) to ensure that we override the free memory pointer at offset
-                // 0x40. This is necessary because the free memory pointer is likely to
-                // be greater than 1 byte when this function is called, but it is incredibly
-                // unlikely that it will be greater than 3 bytes. As for the data within
-                // 0x60, it is ensured that it is 0 due to 0x60 being the zero offset.
-                // - It's fine to clobber the free memory pointer, we're reverting.
-                mstore(88, 0x0000185361666543616c6c3a204e6f7420656e6f75676820676173)
-
-                // Revert with 'Error("SafeCall: Not enough gas")'
-                revert(28, 100)
-            }
-
-            // The call will be supplied at least (((_minGas + 200) * 64) / 63) - 49 gas due to the
-            // above assertion. This ensures that, in all circumstances, the call will
-            // receive at least the minimum amount of gas specified.
-            // We can prove this property by solving the inequalities:
-            // ((((_minGas + 200) * 64) / 63) - 49) >= _minGas
-            // ((((_minGas + 200) * 64) / 63) - 51) * (63 / 64) >= _minGas
-            // Both inequalities hold true for all possible values of `_minGas`.
-            _success := call(
-                gas(), // gas
-                _target, // recipient
-                _value, // ether value
-                add(_calldata, 32), // inloc
-                mload(_calldata), // inlen
-                0x00, // outloc
-                0x00 // outlen
-            )
-        }
-        return _success;
-    }
-}
-
-
-contract RelayMessagerReentrancy {
-
-    mapping(bytes32 => bool) failedMessages;
-
-    mapping(bytes32 => bool) successfulMessages;
-
-    mapping(bytes32 => bool) reentrancyLocks;
-
-    address DEFAULT_L2_SENDER = address(1000);
-    address ESTIMATION_ADDRESS = address(2000);
-
-    address xDomainMsgSender;
-
-    /**
-     * @notice Emitted whenever a message is successfully relayed on this chain.
-     *
-     * @param msgHash Hash of the message that was relayed.
-     */
-    event RelayedMessage(bytes32 indexed msgHash);
-
-    /**
-     * @notice Emitted whenever a message fails to be relayed on this chain.
-     *
-     * @param msgHash Hash of the message that failed to be relayed.
-     */
-    event FailedRelayedMessage(bytes32 indexed msgHash);
-
-    address public otherContract;
-
-    constructor(address _otherContract) {
-        otherContract = _otherContract;
-    }
-
-    function _isOtherMessenger() internal view returns (bool) {
-        // return msg.sender == otherContract;
-        return true;
-    }
-
-     /**
-     * @notice Encodes a cross domain message based on the V0 (legacy) encoding.
-     *
-     * @param _target Address of the target of the message.
-     * @param _sender Address of the sender of the message.
-     * @param _data   Data to send with the message.
-     * @param _nonce  Message nonce.
-     *
-     * @return Encoded cross domain message.
-     */
-    function encodeCrossDomainMessageV0(
-        address _target,
-        address _sender,
-        bytes memory _data,
-        uint256 _nonce
-    ) internal pure returns (bytes memory) {
-        return
-            abi.encodeWithSignature(
-                "relayMessage(address,address,bytes,uint256)",
-                _target,
-                _sender,
-                _data,
-                _nonce
-            );
-    }
-
-    /**
-     * @notice Encodes a cross domain message based on the V1 (current) encoding.
-     *
-     * @param _nonce    Message nonce.
-     * @param _sender   Address of the sender of the message.
-     * @param _target   Address of the target of the message.
-     * @param _value    ETH value to send to the target.
-     * @param _gasLimit Gas limit to use for the message.
-     * @param _data     Data to send with the message.
-     *
-     * @return Encoded cross domain message.
-     */
-    function encodeCrossDomainMessageV1(
-        uint256 _nonce,
-        address _sender,
-        address _target,
-        uint256 _value,
-        uint256 _gasLimit,
-        bytes memory _data
-    ) internal pure returns (bytes memory) {
-        return
-            abi.encodeWithSignature(
-                "relayMessage(uint256,address,address,uint256,uint256,bytes)",
-                _nonce,
-                _sender,
-                _target,
-                _value,
-                _gasLimit,
-                _data
-            );
-    }
-
-
-    function hashCrossDomainMessageV0(
-        address _target,
-        address _sender,
-        bytes memory _data,
-        uint256 _nonce
-    ) internal pure returns (bytes32) {
-        return keccak256(encodeCrossDomainMessageV0(_target, _sender, _data, _nonce));
-    }
-
-    function hashCrossDomainMessageV1(
-        uint256 _nonce,
-        address _sender,
-        address _target,
-        uint256 _value,
-        uint256 _gasLimit,
-        bytes memory _data
-    ) internal pure returns (bytes32) {
-        return
-            keccak256(
-                encodeCrossDomainMessageV1(
-                    _nonce,
-                    _sender,
-                    _target,
-                    _value,
-                    _gasLimit,
-                    _data
-                )
-            );
-    }
-
-    function relayMessage(
+function relayMessage(
         uint256 _nonce,
         address _sender,
         address _target,
@@ -1827,178 +1341,157 @@ contract RelayMessagerReentrancy {
         uint256 _minGasLimit,
         bytes calldata _message
     ) external payable {
-
-        uint256 version = 0;
-
-        if( _nonce > 10) {
-            version = 1;
-        }
-
-        require(
-            version < 2,
-            "CrossDomainMessenger: only version 0 or 1 messages are supported at this time"
-        );
-
-        // If the message is version 0, then it's a migrated legacy withdrawal. We therefore need
-        // to check that the legacy version of the message has not already been relayed.
-
-        bytes32 oldHash = hashCrossDomainMessageV0(_target, _sender, _message, _nonce);
-
-        if (version == 0) {
-            require(
-                successfulMessages[oldHash] == false,
-                "CrossDomainMessenger: legacy withdrawal already relayed"
-            );
-        }
-
-        bytes32 versionedHash = hashCrossDomainMessageV1(
-            _nonce,
-            _sender,
-            _target,
-            _value,
-            _minGasLimit,
-            _message
-        );
-
-         // Check if the reentrancy lock for the `versionedHash` is already set.
-        if (reentrancyLocks[versionedHash]) {
-            revert("ReentrancyGuard: reentrant call");
-        }
-        // Trigger the reentrancy lock for `versionedHash`
-        reentrancyLocks[versionedHash] = true;
-
-        if (_isOtherMessenger()) {
-            // These properties should always hold when the message is first submitted (as
-            // opposed to being replayed).
-            assert(msg.value == _value);
-            assert(!failedMessages[versionedHash]);
-        } else {
-            require(
-                msg.value == 0,
-                "CrossDomainMessenger: value must be zero unless message is from a system address"
-            );
-            require(
-                failedMessages[versionedHash],
-                "CrossDomainMessenger: message cannot be replayed"
-            );
-        }
-
-        require(
-            successfulMessages[versionedHash] == false,
-            "CrossDomainMessenger: message has already been relayed"
-        );
-
-        xDomainMsgSender = _sender;
-    
-        bool success = SafeCall.callWithMinGas(_target, _minGasLimit, _value, _message);
-
-        uint256 glBefore = gasleft();
-
-        console.log("gas left after externall call");
-        console.log(glBefore);
-
-        xDomainMsgSender = DEFAULT_L2_SENDER;
-
-        if (success) {
-            successfulMessages[versionedHash] = true;
-            emit RelayedMessage(versionedHash);
-        } else {
-            failedMessages[versionedHash] = true;
-            emit FailedRelayedMessage(versionedHash);
-
-             if (tx.origin == ESTIMATION_ADDRESS) {
-                revert("CrossDomainMessenger: failed to relay message");
+        // ...
+        //bool success = SafeCall.callWithMinGas(_target, _minGasLimit, _value, _message);
+        bool success;
+        bytes memory _calldata = _message;
+        if (gasleft() >= ((_minGasLimit + 200) * 64) / 63) {
+            assembly {
+                success := call(
+                    gas(), // gas
+                    _target, // recipient
+                    _value, // ether value
+                    add(_calldata, 32), // inloc
+                    mload(_calldata), // inlen
+                    0x00, // outloc
+                    0x00 // outlen
+                )
             }
         }
-
-        // Clear the reentrancy lock for `versionedHash`
-        reentrancyLocks[versionedHash] = false;
-
-        uint256 glAfter = gasleft();
-
-        console.log("gas needed after external call");
-        console.log(glBefore - glAfter);
-
+        // ...
     }
-    
-
-}
-
 ```
-portal.sol
-```solidity
-// SPDX-License-Identifier: MIT
-pragma solidity ^0.8.13;
-
-import "forge-std/console.sol";
-
-import "./RelayMessagerReentrancy.sol";
-
-contract Portal {
-
-    address messenger;
-
-    constructor(address _messenger) {
-        messenger = _messenger;
-    }
-
-    function finalizeWithdraw(uint256 minGas, uint256 value, bytes memory data) public payable {
-
-        bool success = SafeCall.callWithMinGas(
-            messenger, 
-            minGas, 
-            value, 
-            data
-        );
-
-        console.log("success after finalize withdraw????");
-        console.log(success);
-    }   
-
-}
-```
-Below is a link to download a file containing the test and all associated files which you can use to replicate the test we have conducted above:
-https://drive.google.com/file/d/1Zpc7ue0LwWatOWjFH30r8RCtbY4nej2w/view?usp=share_link
-## Tool used
-
-Manual Review
-
-## Recommendation
-we recommend to add gas buffer back, change at least gas buffer from 200 to 20K or even higher gas buffer.
 
 
 
 ## Discussion
 
+**maurelian**
+
+This one is tricky. 
+The recommendation is a good one, and we agree that it is better to avoid reverting on this code path, however it is also speculative as it depends on some future gas schedule changes and lacks a PoC.
+
 **GalloDaSballo**
 
-I think this is slightly different, but is basically dup of #40 
+Per the rules:
+<img width="774" alt="Screenshot 2023-04-18 at 09 51 40" src="https://user-images.githubusercontent.com/13383782/232709388-8822f20d-152b-4e0a-bec6-463c5e228544.png">
+<img width="778" alt="Screenshot 2023-04-18 at 09 51 59" src="https://user-images.githubusercontent.com/13383782/232709479-c6c8f02d-febb-4c09-be59-ad52e4886328.png">
+
+
+I don't think the pre-conditions"have a reasonable chance of becoming true in the future", as this would require:
+- Computing incorrect limit
+- Waiting for Hardfork
+- Hardfork does change CALL / base level costs (risk of every `transfer` contract being bricked)
+- User is oblivious and doesn't fix
+- Relaying (and getting griefed)
+
+**GalloDaSballo**
+
+Recommend: Closing as invalid
+
+**HE1M**
+
+Escalate for 10 USDC
+
+Using **revert** in `L1CrossDomainMessenger` clearly breaks the replayability guarantee of the project.
+In the report it is mentioned that:
+>due to usage of revert opcode instead of return, users can lose fund if for any reason the gas left is not meeting the condition in L1CrossDomainMessenger
+
+I agree with your comment regarding Future issues, but the EIP proposed assumption, is just an example for better understanding.
+
+In other words, the project tried to estimate the gas consumption accurately enough when crossing the message from L2 to L1, so that correct amount of gas is forwarded to the target. If, in the middle something happens, there is replayability mechanism to guarantee that the users are able to retry their withdrawal. But, due to this wrong usage of **revert** all those efforts can be broken, and users' fund can be lost.
+
+
+Please also note that providing a scenario to reach to the [**revert**](https://github.com/sherlock-audit/2023-03-optimism/blob/0cdcafe158e00766de7fb5bb6ff2055a10b0dc78/optimism/packages/contracts-bedrock/contracts/libraries/SafeCall.sol#L82) opcode in `L1CrossDomainMessenger.relayMessage` should be considered as a separate bug, because there were lots of effort to calculate the correct gas estimation. So, reaching to this [line of code](https://github.com/sherlock-audit/2023-03-optimism/blob/0cdcafe158e00766de7fb5bb6ff2055a10b0dc78/optimism/packages/contracts-bedrock/contracts/libraries/SafeCall.sol#L82) means that something is broken in the middle.
+
+For example, due to math miscalculation of the gas (as reported in this contest like: #40 #5 , ...) the **revert** is reachable and can result to loss of fund. But, if **revert** was not used, the message would be considered as failed, and the tx would be able to be replayed. So, other bugs would have less impact.
+
+All in all, this wrong usage of **revert** is a bug besides other bugs (math miscalculations) that lead to reaching to this [line of code](https://github.com/sherlock-audit/2023-03-optimism/blob/0cdcafe158e00766de7fb5bb6ff2055a10b0dc78/optimism/packages/contracts-bedrock/contracts/libraries/SafeCall.sol#L82).
+
+For example, in the following function `sampleFunction`, there are lots of processing in `Part A` to ensure that `x` is bigger than `10`. If `x` is lower than 10, `Part B` is reachable and will be executed.
+
+```solidity
+function sampleFunction() {
+        // Part A: all the processing to ensure x is bigger than 10
+        if(x < 10){
+            // Part B: some other processing
+        }
+        // remaining of the code
+    }
+```
+
+In this sample code, there are two ways to find bug:
+
+1. Finding a bug in `Part A` that leads to `x` lower than 10
+2. Finding a bug in `Part B`
+
+You can replace, the `gasLeft()` with `x`, `10` with `((_minGasLimit + 200) * 64) / 63)`, `Part A` with all the math calculations for the gas estimation, and `Part B` with the [lines](https://github.com/sherlock-audit/2023-03-optimism/blob/0cdcafe158e00766de7fb5bb6ff2055a10b0dc78/optimism/packages/contracts-bedrock/contracts/libraries/SafeCall.sol#L65-L82).
+
+In this report, I found a bug in `Part B` which should be considered separate from the bug related to `Part A`.
+
+**sherlock-admin**
+
+ > Escalate for 10 USDC
+> 
+> Using **revert** in `L1CrossDomainMessenger` clearly breaks the replayability guarantee of the project.
+> In the report it is mentioned that:
+> >due to usage of revert opcode instead of return, users can lose fund if for any reason the gas left is not meeting the condition in L1CrossDomainMessenger
+> 
+> I agree with your comment regarding Future issues, but the EIP proposed assumption, is just an example for better understanding.
+> 
+> In other words, the project tried to estimate the gas consumption accurately enough when crossing the message from L2 to L1, so that correct amount of gas is forwarded to the target. If, in the middle something happens, there is replayability mechanism to guarantee that the users are able to retry their withdrawal. But, due to this wrong usage of **revert** all those efforts can be broken, and users' fund can be lost.
+> 
+> 
+> Please also note that providing a scenario to reach to the [**revert**](https://github.com/sherlock-audit/2023-03-optimism/blob/0cdcafe158e00766de7fb5bb6ff2055a10b0dc78/optimism/packages/contracts-bedrock/contracts/libraries/SafeCall.sol#L82) opcode in `L1CrossDomainMessenger.relayMessage` should be considered as a separate bug, because there were lots of effort to calculate the correct gas estimation. So, reaching to this [line of code](https://github.com/sherlock-audit/2023-03-optimism/blob/0cdcafe158e00766de7fb5bb6ff2055a10b0dc78/optimism/packages/contracts-bedrock/contracts/libraries/SafeCall.sol#L82) means that something is broken in the middle.
+> 
+> For example, due to math miscalculation of the gas (as reported in this contest like: #40 #5 , ...) the **revert** is reachable and can result to loss of fund. But, if **revert** was not used, the message would be considered as failed, and the tx would be able to be replayed. So, other bugs would have less impact.
+> 
+> All in all, this wrong usage of **revert** is a bug besides other bugs (math miscalculations) that lead to reaching to this [line of code](https://github.com/sherlock-audit/2023-03-optimism/blob/0cdcafe158e00766de7fb5bb6ff2055a10b0dc78/optimism/packages/contracts-bedrock/contracts/libraries/SafeCall.sol#L82).
+> 
+> For example, in the following function `sampleFunction`, there are lots of processing in `Part A` to ensure that `x` is bigger than `10`. If `x` is lower than 10, `Part B` is reachable and will be executed.
+> 
+> ```solidity
+> function sampleFunction() {
+>         // Part A: all the processing to ensure x is bigger than 10
+>         if(x < 10){
+>             // Part B: some other processing
+>         }
+>         // remaining of the code
+>     }
+> ```
+> 
+> In this sample code, there are two ways to find bug:
+> 
+> 1. Finding a bug in `Part A` that leads to `x` lower than 10
+> 2. Finding a bug in `Part B`
+> 
+> You can replace, the `gasLeft()` with `x`, `10` with `((_minGasLimit + 200) * 64) / 63)`, `Part A` with all the math calculations for the gas estimation, and `Part B` with the [lines](https://github.com/sherlock-audit/2023-03-optimism/blob/0cdcafe158e00766de7fb5bb6ff2055a10b0dc78/optimism/packages/contracts-bedrock/contracts/libraries/SafeCall.sol#L65-L82).
+> 
+> In this report, I found a bug in `Part B` which should be considered separate from the bug related to `Part A`.
+
+You've created a valid escalation for 10 USDC!
+
+To remove the escalation from consideration: Delete your comment.
+
+You may delete or edit your escalation comment anytime before the 48-hour escalation window closes. After that, the escalation becomes final.
 
 **hrishibhat**
 
-Sponsor comment:
-Tentatively marking this issue as false. The reporter is working off of outdated information (the PR description that the reporter reference was not the final implementation spec), though that may have not been entirely clear based off of the comments in the PR. In addition, the POC that was presented does not use the canonical set of contracts. The reporter is welcome to escalate this issue if they are able to replicate the issue on the canonical version of `contracts-bedrock`.
+Escalation accepted
 
-**GalloDaSballo**
+After further discussions with the Lead judge and the protocol this issue was considered to be a weak version of #40, hence considering this issue a valid solo medium. 
 
-Because we know that #40 is valid, as it will not account for the cost of CALL, I believe the finding to be valid
+**sherlock-admin**
 
-If the sponsor wishes to downgrade this due to POC, we could leave as Med, and the Watson can Escalate to have it re-evaluated as High (dup or #40)
+> Escalation accepted
+> 
+> After further discussions with the Lead judge and the protocol this issue was considered to be a weak version of #40, hence considering this issue a valid solo medium. 
 
-**GalloDaSballo**
+This issue's escalations have been accepted!
 
-Recommend: 
-Downgrade to Med
-Make this Primary
-Make #7 dup of this
+Contestants' payouts and scores will be updated according to the changes made on this issue.
 
-**GalloDaSballo**
-
-Partially following Sponsor advice, I believe the Watson showed the problem although has articulated in a less correct way
-
-As such am downgrading to Unique Med
-
-# Issue M-6: Incorrect calculation of required gas limit during deposit transaction 
+# Issue M-5: Incorrect calculation of required gas limit during deposit transaction 
 
 Source: https://github.com/sherlock-audit/2023-03-optimism-judging/issues/9 
 
@@ -2054,12 +1547,12 @@ require(_gasLimit >= 21_000 + _data.length * 16, "OptimismPortal: gas limit must
 
 Sidestepping of cost, no loss of principal, agree with Med
 
-# Issue M-7: Causing users lose fund if bridging long message from L2 to L1 due to uncontrolled out-of-gas error 
+# Issue M-6: Causing users lose fund if bridging long message from L2 to L1 due to uncontrolled out-of-gas error 
 
 Source: https://github.com/sherlock-audit/2023-03-optimism-judging/issues/5 
 
 ## Found by 
-HE1M, obront
+HE1M
 
 ## Summary
 
@@ -2260,4 +1753,78 @@ This is similar to issue #96 whereby a withdrawal with a gas limit configured to
 **GalloDaSballo**
 
 Making this primary
+
+**ydspa**
+
+Escalate for 10 USDC.
+
+This finding should be invalid. 
+
+It's description for ````HashingGas```` is inaccurate , the gas cost for keccak256 hashing is only ````6 gas per 32 bytes````, which is linear. The primary issue in this case, as illustrated in https://github.com/sherlock-audit/2023-03-optimism-judging/issues/52,  is that the current implementation is missing to consider the dynamic gas cost of memory usage, which is quadratic. Both of the two parts are not ````exponential```` as described in this finding. As opposed to https://github.com/sherlock-audit/2023-03-optimism-judging/issues/52, It's clear that this finding didn't provide full aspects and accurate analysis of the issue.
+
+
+
+**sherlock-admin**
+
+ > Escalate for 10 USDC.
+> 
+> This finding should be invalid. 
+> 
+> It's description for ````HashingGas```` is inaccurate , the gas cost for keccak256 hashing is only ````6 gas per 32 bytes````, which is linear. The primary issue in this case, as illustrated in https://github.com/sherlock-audit/2023-03-optimism-judging/issues/52,  is that the current implementation is missing to consider the dynamic gas cost of memory usage, which is quadratic. Both of the two parts are not ````exponential```` as described in this finding. As opposed to https://github.com/sherlock-audit/2023-03-optimism-judging/issues/52, It's clear that this finding didn't provide full aspects and accurate analysis of the issue.
+> 
+> 
+
+You've created a valid escalation for 10 USDC!
+
+To remove the escalation from consideration: Delete your comment.
+
+You may delete or edit your escalation comment anytime before the 48-hour escalation window closes. After that, the escalation becomes final.
+
+**HE1M**
+
+Escalate for 10 USDC
+
+Some points:
+
+1. This report is not duplicate of #96.
+2. This report is not dependent on the user's mistake (or misconfiguration). It shows that due to wrong calculation of [`baseGas`](https://github.com/sherlock-audit/2023-03-optimism/blob/0cdcafe158e00766de7fb5bb6ff2055a10b0dc78/optimism/packages/contracts-bedrock/contracts/universal/CrossDomainMessenger.sol#L423-L435) it does break the CrossDomainMessenger's replayability guarantee in case the user's message is long enough. 
+3. The term `HashingGas` is **not** including only the `kecca256`. As it is explained in the report: 
+> the consumed gas from line 304 to line 325 is called HashingGas
+4. In the report, the working code is provided to show how the gas consumption is dependent to the length of the message.
+
+**sherlock-admin**
+
+ > Escalate for 10 USDC
+> 
+> Some points:
+> 
+> 1. This report is not duplicate of #96.
+> 2. This report is not dependent on the user's mistake (or misconfiguration). It shows that due to wrong calculation of [`baseGas`](https://github.com/sherlock-audit/2023-03-optimism/blob/0cdcafe158e00766de7fb5bb6ff2055a10b0dc78/optimism/packages/contracts-bedrock/contracts/universal/CrossDomainMessenger.sol#L423-L435) it does break the CrossDomainMessenger's replayability guarantee in case the user's message is long enough. 
+> 3. The term `HashingGas` is **not** including only the `kecca256`. As it is explained in the report: 
+> > the consumed gas from line 304 to line 325 is called HashingGas
+> 4. In the report, the working code is provided to show how the gas consumption is dependent to the length of the message.
+
+You've created a valid escalation for 10 USDC!
+
+To remove the escalation from consideration: Delete your comment.
+
+You may delete or edit your escalation comment anytime before the 48-hour escalation window closes. After that, the escalation becomes final.
+
+**hrishibhat**
+
+Escalation accepted
+
+Accepting the 2nd escalation,
+Considering this issue a separate valid medium issue based on the escalation comments
+
+**sherlock-admin**
+
+> Escalation accepted
+> 
+> Accepting the 2nd escalation,
+> Considering this issue a separate valid medium issue based on the escalation comments
+
+This issue's escalations have been accepted!
+
+Contestants' payouts and scores will be updated according to the changes made on this issue.
 
